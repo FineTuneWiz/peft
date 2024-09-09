@@ -374,9 +374,9 @@ class LoraConfig(PeftConfig):
 
         self._custom_modules: Optional[dict[type[nn.Mmodule], type[nn.Module]]] = None
 
-        # Ensure mask_tensor is either None or a torch.Tensor
-        if self.lora_mask is not None and not isinstance(self.lora_mask, torch.Tensor):
-            raise TypeError("mask_tensor must be a torch.Tensor or None")
+        # # Ensure mask_tensor is either None or a torch.Tensor
+        # if self.lora_mask is not None and not isinstance(self.lora_mask, torch.Tensor):
+        #     raise TypeError("mask_tensor must be a torch.Tensor or None")
 
 
     def _register_custom_module(self, mapping: dict[type[nn.Mmodule], type[nn.Module]]) -> None:

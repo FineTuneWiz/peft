@@ -168,7 +168,7 @@ class LoraConfig(PeftConfig):
     )
     lora_alpha: int = field(default=8, metadata={"help": "Lora alpha"})
     lora_dropout: float = field(default=0.0, metadata={"help": "Lora dropout"})
-    lora_mask: torch.Tensor = field(default=None, metadata={"help": "Mask tensor for Lora"})
+    lora_mask: Optional[torch.Tensor] = field(default=None, metadata={"help": "Mask tensor for Lora"})
     fan_in_fan_out: bool = field(
         default=False,
         metadata={"help": "Set this to True if the layer to replace stores weight like (fan_in, fan_out)"},

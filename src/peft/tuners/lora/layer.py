@@ -102,7 +102,7 @@ class LoraLayer(BaseTunerLayer):
         self.out_features = out_features
 
     def update_layer(
-        self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora, use_dora: bool = False, mask: Optional[torch.Tensor] = None
+        self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora, use_dora: bool = False, lora_mask: Optional[torch.Tensor] = None
     ):
         # This code works for linear layers, override for other layer types
         if r <= 0:
@@ -146,8 +146,8 @@ class LoraLayer(BaseTunerLayer):
             self.use_dora[adapter_name] = False
 
         # Register the mask for the adapter if provided
-        if mask is not None:
-            self.lora_mask.update({adapter_name: mask})  # Register mask with adapter name
+        if lora_mask is not None:
+            self.lora_mask.update({adapter_name: lora_mask})  # Register mask with adapter name
     
         self.set_adapter(self.active_adapters)
 
@@ -413,7 +413,7 @@ class Linear(nn.Module, LoraLayer):
         init_lora_weights: Union[bool, str] = True,
         use_rslora: bool = False,
         use_dora: bool = False,
-        mask: Optional[torch.Tensor] = None,  # New parameter for mask
+        lora_mask: Optional[torch.Tensor] = None,  # New parameter for mask
         **kwargs,
     ) -> None:
         super().__init__()
@@ -429,7 +429,7 @@ class Linear(nn.Module, LoraLayer):
             init_lora_weights=init_lora_weights,
             use_rslora=use_rslora,
             use_dora=use_dora,
-            mask=mask  # Pass the mask during adapter initialization
+            lora_mask=lora_mask  # Pass the mask during adapter initialization
         )
         self.is_target_conv_1d_layer = is_target_conv_1d_layer
 
@@ -553,9 +553,9 @@ class Linear(nn.Module, LoraLayer):
 
         output_tensor = transpose(weight_B @ weight_A, self.fan_in_fan_out) * self.scaling[adapter]
         # Apply mask if available
-        mask = self.lora_mask.get(adapter, None)
-        if mask is not None:
-            output_tensor *= mask.to(output_tensor.device)
+        lora_mask = self.lora_mask.get(adapter, None)
+        if lora_mask is not None:
+            output_tensor *= lora_mask.to(output_tensor.device)
         if cast_to_fp32:
             output_tensor = output_tensor.to(dtype=dtype)
 
@@ -594,9 +594,9 @@ class Linear(nn.Module, LoraLayer):
                     delta_result = lora_B(lora_A(dropout(x))) * scaling
 
                     # Apply mask if available
-                    mask = self.lora_mask.get(active_adapter, None)
-                    if mask is not None:
-                        delta_result *= mask.to(delta_result.device) # Mask the delta W
+                    lora_mask = self.lora_mask.get(active_adapter, None)
+                    if lora_mask is not None:
+                        delta_result *= lora_mask.to(delta_result.device) # Mask the delta W
                     result = result + delta_result
                 else:
                     x = dropout(x)

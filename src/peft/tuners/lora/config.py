@@ -168,7 +168,7 @@ class LoraConfig(PeftConfig):
     )
     lora_alpha: int = field(default=8, metadata={"help": "Lora alpha"})
     lora_dropout: float = field(default=0.0, metadata={"help": "Lora dropout"})
-    mask_tensor: torch.Tensor = field(default=None, metadata={"help": "Mask tensor for Lora"})
+    lora_mask: torch.Tensor = field(default=None, metadata={"help": "Mask tensor for Lora"})
     fan_in_fan_out: bool = field(
         default=False,
         metadata={"help": "Set this to True if the layer to replace stores weight like (fan_in, fan_out)"},
@@ -375,7 +375,7 @@ class LoraConfig(PeftConfig):
         self._custom_modules: Optional[dict[type[nn.Mmodule], type[nn.Module]]] = None
 
         # Ensure mask_tensor is either None or a torch.Tensor
-        if self.mask_tensor is not None and not isinstance(self.mask_tensor, torch.Tensor):
+        if self.lora_mask is not None and not isinstance(self.lora_mask, torch.Tensor):
             raise TypeError("mask_tensor must be a torch.Tensor or None")
 
 

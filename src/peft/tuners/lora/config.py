@@ -17,7 +17,7 @@ from __future__ import annotations
 import warnings
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Union
-
+import torch
 from torch import nn
 
 from peft.config import PeftConfig

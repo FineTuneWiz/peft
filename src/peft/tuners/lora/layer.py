@@ -20,17 +20,19 @@ from typing import Any, Optional, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from accelerate.utils.imports import is_xpu_available
 from torch import svd_lowrank
 from transformers.pytorch_utils import Conv1D
 
 from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
-from peft.utils.integrations import dequantize_module_weight, gather_params_ctx, get_bnb_param_type
+from peft.utils.integrations import dequantize_module_weight, gather_params_ctx
 from peft.utils.other import transpose
 
 from .config import LoraConfig
-from .dora import DoraConv2dLayer, DoraEmbeddingLayer, DoraLinearLayer
+from .dora import DoraConv2dLayer, DoraLinearLayer
+# torch.cuda.manual_seed_all(42)
+# torch.manual_seed(42)
 
+import time
 
 class LoraLayer(BaseTunerLayer):
     # All names of layers that may contain (trainable) adapter weights
@@ -44,8 +46,8 @@ class LoraLayer(BaseTunerLayer):
         self.lora_alpha = {}
         self.scaling = {}
         self.lora_dropout = nn.ModuleDict({})
-        self.lora_A = nn.ModuleDict({})
-        self.lora_B = nn.ModuleDict({})
+        # self.lora_A = nn.ModuleDict({})
+        # self.lora_B = nn.ModuleDict({})
         # For Embedding layer
         self.lora_embedding_A = nn.ParameterDict({})
         self.lora_embedding_B = nn.ParameterDict({})
@@ -57,6 +59,13 @@ class LoraLayer(BaseTunerLayer):
         self._caches: dict[str, Any] = {}
         self.ephemeral_gpu_offload: bool = ephemeral_gpu_offload
         self.kwargs = kwargs
+        self.mask_percentage = 90
+        self.mask_A = {}
+        self.mask_B = {}
+        self.lora_A = nn.ParameterDict({})
+        self.lora_B = nn.ParameterDict({})
+        self.lora_A_non_trainable = {}
+        self.lora_B_non_trainable = {}
 
         base_layer = self.get_base_layer()
         if isinstance(base_layer, nn.Linear):
@@ -101,7 +110,7 @@ class LoraLayer(BaseTunerLayer):
         self.out_features = out_features
 
     def update_layer(
-        self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora, use_dora: bool = False
+        self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora, lora_config, use_dora: bool = False
     ):
         # This code works for linear layers, override for other layer types
         if r <= 0:
@@ -116,13 +125,53 @@ class LoraLayer(BaseTunerLayer):
 
         self.lora_dropout.update(nn.ModuleDict({adapter_name: lora_dropout_layer}))
         # Actual trainable parameters
-        self.lora_A[adapter_name] = nn.Linear(self.in_features, r, bias=False)
-        self.lora_B[adapter_name] = nn.Linear(r, self.out_features, bias=False)
+        # self.lora_A[adapter_name] = nn.Linear(self.in_features, r, bias=False)
+        # self.lora_B[adapter_name] = nn.Linear(r, self.out_features, bias=False)
+        
+        # Initialize the mask
+        # torch.manual_seed(42)
+        # self.mask_A[adapter_name] = (torch.rand(r, self.in_features) > self.mask_percentage / 100)
+        # self.mask_B[adapter_name] = (torch.rand(self.out_features, r) > self.mask_percentage / 100)
+        if hasattr(lora_config, 'mask') and lora_config.mask is not None:
+            self.mask_A = lora_config.mask.bool()
+            self.sparsity_mask = 1.0-(torch.count_nonzero(self.mask_A).item()/self.mask_A.numel())
+            self.mask_B = self.mask_A.T.bool()  # Assuming you want mask_B to be the transpose of mask_A
+        else:
+            raise ValueError("Mask not provided in LoraConfigWithMask")
+
+        # Initialize full A and B matrices
+        A_full = torch.randn(r, self.in_features)
+        B_full = torch.zeros(self.out_features, r)
+
+        # print("A full - ", A_full)
+        # print("B full - ", B_full)
+        print("Mask A: ", self.mask_A)
+        print("Mask B: ", self.mask_B)
+
+        # Split into trainable and non-trainable parts
+        # self.lora_A[adapter_name] = nn.Parameter(A_full[self.mask_A[adapter_name] == 1])
+        # self.lora_B[adapter_name] = nn.Parameter(B_full[self.mask_B[adapter_name] == 1])
+        # self.lora_A[adapter_name] = nn.Parameter(A_full[self.mask_A[adapter_name] == True])
+        # self.lora_B[adapter_name] = nn.Parameter(B_full[self.mask_B[adapter_name] == True])
+        self.lora_A[adapter_name] = nn.Parameter(A_full[self.mask_A])
+        self.lora_B[adapter_name] = nn.Parameter(B_full[self.mask_B])
+        
+        print("Shape: ", self.lora_A[adapter_name].shape)
+        
+        print("Masked A - ", self.lora_A[adapter_name].data)
+        print("Masked B - ", self.lora_B[adapter_name].data)
+        
+        self.lora_A_non_trainable[adapter_name] = A_full.clone()
+        self.lora_B_non_trainable[adapter_name] = B_full.clone()
+        
         if use_rslora:
             self.scaling[adapter_name] = lora_alpha / math.sqrt(r)
         else:
             self.scaling[adapter_name] = lora_alpha / r
-
+            
+        # self.lora_A[adapter_name].weight.data *= self.mask_A[adapter_name].to(self.lora_A[adapter_name].weight.device)
+        # self.lora_B[adapter_name].weight.data *= self.mask_B[adapter_name].to(self.lora_B[adapter_name].weight.device)
+        
         # for inits that require access to the base weight, use gather_param_ctx so that the weight is gathered when using DeepSpeed
         if isinstance(init_lora_weights, str) and init_lora_weights.startswith("pissa"):
             with gather_params_ctx(self.get_base_layer().weight):
@@ -146,6 +195,14 @@ class LoraLayer(BaseTunerLayer):
 
         self.set_adapter(self.active_adapters)
 
+    # def kaiming_init_1d(self, tensor, a=0, mode='fan_in', nonlinearity='leaky_relu'):
+    #     fan = tensor.size(0)  # Since it's 1D, take the size of the tensor directly
+    #     gain = nn.init.calculate_gain(nonlinearity, a)
+    #     std = gain / math.sqrt(fan)
+    #     bound = math.sqrt(5.0) * std  # Calculate the bound for uniform distribution
+    #     with torch.no_grad():
+    #         tensor.uniform_(-bound, bound)
+    
     def reset_lora_parameters(self, adapter_name, init_lora_weights):
         if init_lora_weights is False:
             return
@@ -154,12 +211,13 @@ class LoraLayer(BaseTunerLayer):
             if init_lora_weights is True:
                 # initialize A the same way as the default for nn.Linear and B to zero
                 # https://github.com/microsoft/LoRA/blob/a0a92e0f26c067cf94747bdbf1ce73793fa44d19/loralib/layers.py#L124
-                nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
+                nn.init.kaiming_uniform_(self.lora_A[adapter_name].unsqueeze(1), a=math.sqrt(5))
+                # self.kaiming_init_1d(self.lora_A[adapter_name], a=math.sqrt(5))
             elif init_lora_weights.lower() == "gaussian":
-                nn.init.normal_(self.lora_A[adapter_name].weight, std=1 / self.r[adapter_name])
+                nn.init.normal_(self.lora_A[adapter_name], std=1 / self.r[adapter_name])
             else:
                 raise ValueError(f"Unknown initialization {init_lora_weights=}")
-            nn.init.zeros_(self.lora_B[adapter_name].weight)
+            nn.init.zeros_(self.lora_B[adapter_name])
         if adapter_name in self.lora_embedding_A.keys():
             # Initialize A to zeros and B the same way as the default for nn.Embedding, see:
             # https://github.com/microsoft/LoRA/blob/4c0333854cb905966f8cc4e9a74068c1e507c7b7/loralib/layers.py#L59-L60
@@ -167,16 +225,11 @@ class LoraLayer(BaseTunerLayer):
             nn.init.normal_(self.lora_embedding_B[adapter_name])
 
     def olora_init(self, adapter_name):
-        base_layer = self.get_base_layer()
-        orig_weight = base_layer.weight
-        bnb_param_type = get_bnb_param_type(orig_weight)
-        dtype = orig_weight.dtype
-
-        if bnb_param_type:
-            # check without importing bitsandbytes and robust to bnb_4bit_quant_storage=float*
-            weight_tensor = dequantize_module_weight(base_layer)
+        dtype = self.get_base_layer().weight.dtype
+        if dtype in [torch.int8, torch.uint8]:
+            weight_tensor = dequantize_module_weight(self.get_base_layer())
         elif dtype in [torch.float32, torch.float16, torch.bfloat16]:
-            weight_tensor = orig_weight
+            weight_tensor = self.get_base_layer().weight
         else:
             raise TypeError(f"Unsupported data type for the base layer. Got {dtype}.")
 
@@ -191,25 +244,8 @@ class LoraLayer(BaseTunerLayer):
         self.lora_B[adapter_name].weight.data = Qr.contiguous()
 
         weight_tensor.data -= scale_factor * self.lora_B[adapter_name].weight @ self.lora_A[adapter_name].weight
-        if bnb_param_type == "4bit":
-            weight_tensor = orig_weight.__class__(
-                weight_tensor,
-                quant_type=orig_weight.quant_type,
-                quant_storage=orig_weight.quant_storage,
-                compress_statistics=orig_weight.compress_statistics,
-                module=orig_weight.module,
-            ).to(orig_weight.device)
-            base_layer.weight = weight_tensor
-        elif bnb_param_type == "8bit":
-            weight_tensor = orig_weight.__class__(
-                weight_tensor,
-                requires_grad=orig_weight.requires_grad,
-                has_fp16_weights=orig_weight.has_fp16_weights,
-            ).to(orig_weight.device)
-            base_layer.weight = weight_tensor
-        else:
-            weight_tensor = weight_tensor.to(dtype)
-            base_layer.weight.data = weight_tensor
+        weight_tensor = weight_tensor.to(dtype)
+        self.get_base_layer().weight.data = weight_tensor
 
     def pissa_init(self, adapter_name, init_lora_weights):
         weight = self.get_base_layer().weight
@@ -277,14 +313,11 @@ class LoraLayer(BaseTunerLayer):
         lora_B = self.lora_B[adapter_name].weight
         place_on_cpu = self.ephemeral_gpu_offload and (lora_A.device.type == "cpu" or lora_B.device.type == "cpu")
         if self.ephemeral_gpu_offload:
-            if lora_A.device.type in ["cuda", "xpu"]:
+            if lora_A.device.type == "cuda":
                 lora_B = lora_B.to(lora_A.device)
             else:
-                if lora_B.device.type not in ["cuda", "xpu"]:
-                    if is_xpu_available():
-                        lora_B = lora_B.to("xpu")
-                    else:
-                        lora_B = lora_B.to("cuda")
+                if lora_B.device.type != "cuda":
+                    lora_B = lora_B.to("cuda")
                 lora_A = lora_A.to(lora_B.device)
         scaling = self.scaling[adapter_name]
         dora_layer.update_layer(
@@ -376,7 +409,7 @@ class LoraLayer(BaseTunerLayer):
 
             # getting the sub-batch, passing it to LoRA layers and updating the corresponding indices of the linear
             # layer output
-            sub_batch = x[sub_batch_indices_list[i]].to(lora_A.weight.dtype)
+            sub_batch = x[sub_batch_indices_list[i]].to(lora_A.dtype)
             lora_output = lora_B(lora_A(dropout(sub_batch))) * scaling
             result[sub_batch_indices_list[i]] += lora_output.to(torch_result_dtype)
 
@@ -399,6 +432,7 @@ class Linear(nn.Module, LoraLayer):
         self,
         base_layer,
         adapter_name: str,
+        lora_config: LoraConfig,
         r: int = 0,
         lora_alpha: int = 1,
         lora_dropout: float = 0.0,
@@ -412,6 +446,8 @@ class Linear(nn.Module, LoraLayer):
         super().__init__()
         LoraLayer.__init__(self, base_layer, **kwargs)
         self.fan_in_fan_out = fan_in_fan_out
+        self.sparsity_delta_W = 0.0
+        self.sparsity_lora = 0.0
 
         self._active_adapter = adapter_name
         self.update_layer(
@@ -421,9 +457,11 @@ class Linear(nn.Module, LoraLayer):
             lora_dropout=lora_dropout,
             init_lora_weights=init_lora_weights,
             use_rslora=use_rslora,
+            lora_config=lora_config,
             use_dora=use_dora,
         )
         self.is_target_conv_1d_layer = is_target_conv_1d_layer
+        self.total_forward_pass_time = 0.0        
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
         """
@@ -528,16 +566,16 @@ class Linear(nn.Module, LoraLayer):
             adapter (str):
                 The name of the adapter for which the delta weight should be computed.
         """
-        device = self.lora_B[adapter].weight.device
-        dtype = self.lora_B[adapter].weight.dtype
+        device = self.lora_B[adapter].device
+        dtype = self.lora_B[adapter].dtype
 
         # In case users wants to merge the adapter weights that are in
         # (b)float16 while being on CPU, we need to cast the weights to float32, perform the merge and then cast back to
         # (b)float16 because some CPUs have slow bf16/fp16 matmuls.
         cast_to_fp32 = device.type == "cpu" and (dtype == torch.float16 or dtype == torch.bfloat16)
 
-        weight_A = self.lora_A[adapter].weight
-        weight_B = self.lora_B[adapter].weight
+        weight_A = self.lora_A[adapter]
+        weight_B = self.lora_B[adapter]
 
         if cast_to_fp32:
             weight_A = weight_A.float()
@@ -549,14 +587,26 @@ class Linear(nn.Module, LoraLayer):
             output_tensor = output_tensor.to(dtype=dtype)
 
             # cast back the weights
-            self.lora_A[adapter].weight.data = weight_A.to(dtype)
-            self.lora_B[adapter].weight.data = weight_B.to(dtype)
+            self.lora_A[adapter].data = weight_A.to(dtype)
+            self.lora_B[adapter].data = weight_B.to(dtype)
 
         return output_tensor
+
+    def reconstruct_weights(self, active_adapter):
+        # Reconstruct full matrices from trainable and non-trainable parts
+        W_a_full = self.lora_A_non_trainable[active_adapter].clone().to(self.lora_A[active_adapter].device)
+        W_b_full = self.lora_B_non_trainable[active_adapter].clone().to(self.lora_B[active_adapter].device)
+
+        W_a_full[self.mask_A] = self.lora_A[active_adapter]
+        W_b_full[self.mask_B] = self.lora_B[active_adapter]
+
+        return W_a_full, W_b_full
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         self._check_forward_args(x, *args, **kwargs)
         adapter_names = kwargs.pop("adapter_names", None)
+        # Timer for forward pass
+        start_time_forward_pass = time.time()
 
         if self.disable_adapters:
             if self.merged:
@@ -572,14 +622,23 @@ class Linear(nn.Module, LoraLayer):
             for active_adapter in self.active_adapters:
                 if active_adapter not in self.lora_A.keys():
                     continue
-                lora_A = self.lora_A[active_adapter]
-                lora_B = self.lora_B[active_adapter]
+
+                W_a_full, W_b_full = self.reconstruct_weights(active_adapter)
+                # self.lora_A[active_adapter].weight.data *= self.mask_A[active_adapter].to(self.lora_A[active_adapter].weight.device)
+                # self.lora_B[active_adapter].weight.data *= self.mask_B[active_adapter].to(self.lora_B[active_adapter].weight.device)
+                lora_A = W_a_full # self.lora_A[active_adapter]
+                lora_B = W_b_full # self.lora_B[active_adapter]
                 dropout = self.lora_dropout[active_adapter]
+                dropout_x = dropout(x) 
                 scaling = self.scaling[active_adapter]
-                x = x.to(lora_A.weight.dtype)
+                x = x.to(lora_A.dtype)
 
                 if not self.use_dora[active_adapter]:
-                    result = result + lora_B(lora_A(dropout(x))) * scaling
+                    self.sparsity_lora = 1.0 - (torch.count_nonzero(lora_B).item() / lora_B.numel())
+                    intermediate = torch.matmul(dropout_x, lora_A.T)  # Shape: (batch_size, sequence_length, rank)
+                    delta_W = torch.matmul(intermediate, lora_B.T) * scaling  # Shape: (batch_size, sequence_length, hidden_size)
+                    result = result + delta_W
+                    self.sparsity_delta_W = 1.0-(torch.count_nonzero(delta_W).item()/delta_W.numel())
                 else:
                     x = dropout(x)
                     result = result + self.lora_magnitude_vector[active_adapter](
@@ -592,6 +651,9 @@ class Linear(nn.Module, LoraLayer):
 
             result = result.to(torch_result_dtype)
 
+        # Stop the forward pass timer
+        elapsed_time_forward_pass = time.time() - start_time_forward_pass
+        self.total_forward_pass_time += elapsed_time_forward_pass
         return result
 
     def __repr__(self) -> str:
@@ -615,6 +677,9 @@ class Embedding(nn.Module, LoraLayer):
     ) -> None:
         super().__init__()
         LoraLayer.__init__(self, base_layer)
+
+        if use_dora:
+            raise ValueError(f"{self.__class__.__name__} does not support DoRA yet, please set it to False")
 
         self._active_adapter = adapter_name
         self.update_layer(
@@ -654,30 +719,8 @@ class Embedding(nn.Module, LoraLayer):
         elif init_lora_weights:
             self.reset_lora_parameters(adapter_name, init_lora_weights)
 
-        # call this before dora_init
         self._move_adapter_to_device_of_base_layer(adapter_name)
-
-        if use_dora:
-            self.dora_init(adapter_name)
-            self.use_dora[adapter_name] = True
-        else:
-            self.use_dora[adapter_name] = False
-
         self.set_adapter(self.active_adapters)
-
-    def dora_init(self, adapter_name: str) -> None:
-        if self.lora_magnitude_vector is None:
-            # first dora layer being added, add lora_magnitude_vector to the list of learnable parameters
-            self.adapter_layer_names = self.adapter_layer_names[:] + ("lora_magnitude_vector",)
-
-        dora_layer = DoraEmbeddingLayer(fan_in_fan_out=True)
-        lora_embedding_A = self.lora_embedding_A[adapter_name]
-        lora_embedding_B = self.lora_embedding_B[adapter_name]
-        scaling = self.scaling[adapter_name]
-        dora_layer.update_layer(
-            base_layer=self.get_base_layer(), lora_A=lora_embedding_A, lora_B=lora_embedding_B, scaling=scaling
-        )
-        self.lora_magnitude_vector[adapter_name] = dora_layer
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
         """
@@ -826,20 +869,8 @@ class Embedding(nn.Module, LoraLayer):
                 embedding_A = self.lora_embedding_A[active_adapter].T
                 embedding_B = self.lora_embedding_B[active_adapter].T
                 scaling = self.scaling[active_adapter]
-
-                if not self.use_dora[active_adapter]:
-                    after_A = self._embed(x, embedding_A)
-                    result = result + (after_A @ embedding_B) * scaling
-                else:
-                    mag_norm_scale, dora_result = self.lora_magnitude_vector[active_adapter](
-                        x,
-                        lora_A=embedding_A,
-                        lora_B=embedding_B,
-                        scaling=scaling,
-                        base_layer=self.get_base_layer(),
-                        embed_fn=self._embed,
-                    )
-                    result = mag_norm_scale * result + dora_result
+                after_A = self._embed(x, embedding_A)
+                result = result + (after_A @ embedding_B) * scaling
             result = result.to(torch_result_dtype)
 
         return result
@@ -1092,7 +1123,7 @@ class Conv2d(nn.Module, LoraLayer):
                 dropout = self.lora_dropout[active_adapter]
                 scaling = self.scaling[active_adapter]
                 x = x.to(lora_A.weight.dtype)
-
+                
                 if not self.use_dora[active_adapter]:
                     result = result + lora_B(lora_A(dropout(x))) * scaling
                 else:
@@ -1142,7 +1173,7 @@ def dispatch_default(
             )
             kwargs["fan_in_fan_out"] = lora_config.fan_in_fan_out = False
         kwargs.update(lora_config.loftq_config)
-        new_module = Linear(target, adapter_name, **kwargs)
+        new_module = Linear(target, adapter_name, lora_config, **kwargs)
     elif isinstance(target_base_layer, Conv1D):
         if not kwargs["fan_in_fan_out"]:
             warnings.warn(
@@ -1150,6 +1181,6 @@ def dispatch_default(
             )
             kwargs["fan_in_fan_out"] = lora_config.fan_in_fan_out = True
         kwargs.update(lora_config.loftq_config)
-        new_module = Linear(target, adapter_name, is_target_conv_1d_layer=True, **kwargs)
+        new_module = Linear(target, adapter_name, lora_config, is_target_conv_1d_layer=True, **kwargs)
 
     return new_module

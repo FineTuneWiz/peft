@@ -60,13 +60,11 @@ from .tuners import (
     PrefixTuningConfig,
     PromptEncoderConfig,
     PromptTuningConfig,
-    VBLoRAConfig,
-    VBLoRAModel,
     VeraConfig,
     VeraModel,
     XLoraConfig,
 )
-from .tuners.tuners_utils import BaseTuner
+from .tuners.tuners_utils import BaseTuner as _BaseTuner
 from .utils import _prepare_prompt_learning_config
 
 
@@ -103,10 +101,9 @@ PEFT_TYPE_TO_CONFIG_MAPPING: dict[str, type[PeftConfig]] = {
     "FOURIERFT": FourierFTConfig,
     "XLORA": XLoraConfig,
     "HRA": HRAConfig,
-    "VBLORA": VBLoRAConfig,
 }
 
-PEFT_TYPE_TO_TUNER_MAPPING: dict[str, type[BaseTuner]] = {
+PEFT_TYPE_TO_TUNER_MAPPING: dict[str, type[_BaseTuner]] = {
     "LORA": LoraModel,
     "LOHA": LoHaModel,
     "LOKR": LoKrModel,
@@ -120,7 +117,6 @@ PEFT_TYPE_TO_TUNER_MAPPING: dict[str, type[BaseTuner]] = {
     "FOURIERFT": FourierFTModel,
     "XLORA": XLoraModel,
     "HRA": HRAModel,
-    "VBLORA": VBLoRAModel,
 }
 
 
@@ -163,11 +159,13 @@ def get_peft_model(
             The revision of the base model. If this isn't set, the saved peft model will load the `main` revision for
             the base model
     """
-    model_config = BaseTuner.get_model_config(model)
+    model_config = getattr(model, "config", {"model_type": "custom"})
+    if hasattr(model_config, "to_dict"):
+        model_config = model_config.to_dict()
+
     old_name = peft_config.base_model_name_or_path
     new_name = model.__dict__.get("name_or_path", None)
     peft_config.base_model_name_or_path = new_name
-
     if (old_name is not None) and (old_name != new_name):
         warnings.warn(
             f"The PEFT config's `base_model_name_or_path` was renamed from '{old_name}' to '{new_name}'. "
@@ -180,6 +178,12 @@ def get_peft_model(
                 f"peft config has already set base model revision to {peft_config.revision}, overwriting with revision {revision}"
             )
         peft_config.revision = revision
+
+    # Handle mask if provided in LoraConfigWithMask
+    if hasattr(peft_config, "mask") and peft_config.mask is not None:
+        print(f"Mask provided with shape {peft_config.mask.shape}")
+    else:
+        print("No mask provided. Proceeding without applying a mask.")
 
     if mixed:
         # note: PeftMixedModel does not support autocast_adapter_dtype, so don't pass it

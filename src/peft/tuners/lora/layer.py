@@ -22,6 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import svd_lowrank
 from transformers.pytorch_utils import Conv1D
+from torch_sparse import spspmm, transpose
 
 from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 from peft.utils.integrations import dequantize_module_weight, gather_params_ctx
@@ -64,8 +65,6 @@ class LoraLayer(BaseTunerLayer):
         self.mask_B = {}
         self.lora_A = nn.ParameterDict({})
         self.lora_B = nn.ParameterDict({})
-        self.lora_A_non_trainable = {}
-        self.lora_B_non_trainable = {}
 
         base_layer = self.get_base_layer()
         if isinstance(base_layer, nn.Linear):
@@ -139,16 +138,20 @@ class LoraLayer(BaseTunerLayer):
             raise ValueError("Mask not provided in LoraConfigWithMask")
 
 
-        self.lora_A[adapter_name] = nn.Parameter(torch.sparse_coo_tensor(
-            indices=torch.nonzero(self.mask_A[adapter_name]).T,
-            values=torch.randn(self.mask_A[adapter_name].sum()),
-            size=(r,self.in_features)
+        # Initialize sparse tensors
+        indices_A = torch.nonzero(self.mask_A).t()
+        values_A = torch.randn(self.mask_A.sum()) / r
+        self.lora_A = nn.Parameter(torch.sparse_coo_tensor(
+            indices_A, values_A, size=(r, base_layer.in_features)
         ))
 
-        self.lora_B[adapter_name] = nn.Parameter(torch.sparse_coo_tensor(
-            indices=torch.nonzero(self.mask_B[adapter_name]).T,
-            values=torch.randn(self.mask_B[adapter_name].sum()),
-            size=(self.out_features, r)
+        indices_B = torch.stack([
+            torch.arange(base_layer.out_features).repeat_interleave(r),
+            torch.arange(r).repeat(base_layer.out_features)
+        ])
+        values_B = torch.zeros(base_layer.out_features * r)
+        self.lora_B = nn.Parameter(torch.sparse_coo_tensor(
+            indices_B, values_B, size=(base_layer.out_features, r)
         ))
         
         if use_rslora:
@@ -613,6 +616,28 @@ class Linear(nn.Module, LoraLayer):
                     intermediate = torch.sparse.mm(x_sparse, lora_A.t())
                     delta_W = torch.sparse.mm(intermediate, lora_B.t()) * scaling
                     result = result + delta_W
+
+
+                    intermediate_indices, intermediate_values = spspmm(
+                        x_sparse.indices(), x_sparse.values(),
+                        self.lora_A.indices(), self.lora_A.values(),
+                        x_sparse.size(0), self.lora_A.size(1), self.lora_A.size(0)
+                    )
+            
+                    # Another Sparse-Sparse Matrix Multiplication
+                    delta_indices, delta_values = spspmm(
+                        intermediate_indices, intermediate_values,
+                        self.lora_B.indices(), self.lora_B.values(),
+                        intermediate_indices.size(1), self.lora_B.size(1), self.lora_B.size(0)
+                    )
+            
+                    # Convert back to dense and add to result
+                    delta_W = torch.sparse_coo_tensor(
+                        delta_indices, delta_values, size=(x.size(0), self.base_layer.out_features)
+                    ).to_dense() * self.scaling
+            
+                    result += delta_W
+
                 else:
                     x = dropout(x)
                     result = result + self.lora_magnitude_vector[active_adapter](

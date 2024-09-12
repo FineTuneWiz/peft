@@ -133,36 +133,24 @@ class LoraLayer(BaseTunerLayer):
         # self.mask_A[adapter_name] = (torch.rand(r, self.in_features) > self.mask_percentage / 100)
         # self.mask_B[adapter_name] = (torch.rand(self.out_features, r) > self.mask_percentage / 100)
         if hasattr(lora_config, 'mask') and lora_config.mask is not None:
-            self.mask_A = lora_config.mask.bool()
+            self.mask_A[adapter_name] = lora_config.mask.bool()
             self.sparsity_mask = 1.0-(torch.count_nonzero(self.mask_A).item()/self.mask_A.numel())
-            self.mask_B = self.mask_A.T.bool()  # Assuming you want mask_B to be the transpose of mask_A
+            self.mask_B = self.mask_A[adapter_name].T.bool()  # Assuming you want mask_B to be the transpose of mask_A
         else:
             raise ValueError("Mask not provided in LoraConfigWithMask")
 
-        # Initialize full A and B matrices
-        A_full = torch.randn(r, self.in_features)
-        B_full = torch.zeros(self.out_features, r)
 
-        # print("A full - ", A_full)
-        # print("B full - ", B_full)
-        print("Mask A: ", self.mask_A)
-        print("Mask B: ", self.mask_B)
+        self.lora_A[adapter_name] = nn.Parameter(torch.sparse_coo_tensor(
+            indices=torch.nonzero(self.mask_A[adapter_name]).T,
+            values=torch.randn(self.mask_A[adapter_name].sum()),
+            size=(r,self.in_features)
+        ))
 
-        # Split into trainable and non-trainable parts
-        # self.lora_A[adapter_name] = nn.Parameter(A_full[self.mask_A[adapter_name] == 1])
-        # self.lora_B[adapter_name] = nn.Parameter(B_full[self.mask_B[adapter_name] == 1])
-        # self.lora_A[adapter_name] = nn.Parameter(A_full[self.mask_A[adapter_name] == True])
-        # self.lora_B[adapter_name] = nn.Parameter(B_full[self.mask_B[adapter_name] == True])
-        self.lora_A[adapter_name] = nn.Parameter(A_full[self.mask_A])
-        self.lora_B[adapter_name] = nn.Parameter(B_full[self.mask_B])
-        
-        print("Shape: ", self.lora_A[adapter_name].shape)
-        
-        print("Masked A - ", self.lora_A[adapter_name].data)
-        print("Masked B - ", self.lora_B[adapter_name].data)
-        
-        self.lora_A_non_trainable[adapter_name] = A_full.clone()
-        self.lora_B_non_trainable[adapter_name] = B_full.clone()
+        self.lora_B[adapter_name] = nn.Parameter(torch.sparse_coo_tensor(
+            indices=torch.nonzero(self.mask_B[adapter_name]).T,
+            values=torch.randn(self.mask_B[adapter_name].sum()),
+            size=(self.out_features, r)
+        ))
         
         if use_rslora:
             self.scaling[adapter_name] = lora_alpha / math.sqrt(r)
@@ -592,15 +580,7 @@ class Linear(nn.Module, LoraLayer):
 
         return output_tensor
 
-    def reconstruct_weights(self, active_adapter):
-        # Reconstruct full matrices from trainable and non-trainable parts
-        W_a_full = self.lora_A_non_trainable[active_adapter].clone().to(self.lora_A[active_adapter].device)
-        W_b_full = self.lora_B_non_trainable[active_adapter].clone().to(self.lora_B[active_adapter].device)
-
-        W_a_full[self.mask_A] = self.lora_A[active_adapter]
-        W_b_full[self.mask_B] = self.lora_B[active_adapter]
-
-        return W_a_full, W_b_full
+    
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         self._check_forward_args(x, *args, **kwargs)
@@ -623,22 +603,18 @@ class Linear(nn.Module, LoraLayer):
                 if active_adapter not in self.lora_A.keys():
                     continue
 
-                W_a_full, W_b_full = self.reconstruct_weights(active_adapter)
-                # self.lora_A[active_adapter].weight.data *= self.mask_A[active_adapter].to(self.lora_A[active_adapter].weight.device)
-                # self.lora_B[active_adapter].weight.data *= self.mask_B[active_adapter].to(self.lora_B[active_adapter].weight.device)
-                lora_A = W_a_full # self.lora_A[active_adapter]
-                lora_B = W_b_full # self.lora_B[active_adapter]
+                lora_A = self.lora_A[active_adapter]
+                lora_B = self.lora_B[active_adapter]
                 dropout = self.lora_dropout[active_adapter]
-                dropout_x = dropout(x) 
                 scaling = self.scaling[active_adapter]
-                x = x.to(lora_A.dtype)
+                x_sparse = x.to_sparse()
+                
+
 
                 if not self.use_dora[active_adapter]:
-                    self.sparsity_lora = 1.0 - (torch.count_nonzero(lora_B).item() / lora_B.numel())
-                    intermediate = torch.matmul(dropout_x, lora_A.T)  # Shape: (batch_size, sequence_length, rank)
-                    delta_W = torch.matmul(intermediate, lora_B.T) * scaling  # Shape: (batch_size, sequence_length, hidden_size)
+                    intermediate = torch.sparse.mm(x_sparse, lora_A.t())
+                    delta_W = torch.sparse.mm(intermediate, lora_B.t()) * scaling
                     result = result + delta_W
-                    self.sparsity_delta_W = 1.0-(torch.count_nonzero(delta_W).item()/delta_W.numel())
                 else:
                     x = dropout(x)
                     result = result + self.lora_magnitude_vector[active_adapter](

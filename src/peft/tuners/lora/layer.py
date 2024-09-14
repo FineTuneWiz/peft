@@ -103,7 +103,7 @@ class LoraLayer(BaseTunerLayer):
         self.out_features = out_features
 
     def update_layer(
-        self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora, use_dora: bool = False, lora_mask
+        self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora, lora_mask=None, use_dora: bool = False
     ):
         # This code works for linear layers, override for other layer types
         if r <= 0:

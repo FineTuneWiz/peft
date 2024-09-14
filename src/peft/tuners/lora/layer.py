@@ -412,6 +412,7 @@ class Linear(nn.Module, LoraLayer):
         self,
         base_layer,
         adapter_name: str,
+        lora_config: LoraConfig,
         r: int = 0,
         lora_alpha: int = 1,
         lora_dropout: float = 0.0,

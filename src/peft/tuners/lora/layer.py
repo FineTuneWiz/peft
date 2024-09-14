@@ -57,7 +57,7 @@ class LoraLayer(BaseTunerLayer):
         self._caches: dict[str, Any] = {}
         self.ephemeral_gpu_offload: bool = ephemeral_gpu_offload
         self.kwargs = kwargs
-        self.lora_mask = {}
+        self.mask = {}
 
 
         base_layer = self.get_base_layer()
@@ -125,8 +125,8 @@ class LoraLayer(BaseTunerLayer):
         # if self.lora_mask is not None:
         #     self.lora_mask[adapter_name] = nn.Parameter(self.lora_mask, requires_grad = False)
 
-        if hasattr(lora_config, 'lora_mask') and lora_config.lora_mask is not None:
-            self.lora_mask = lora_config.lora_mask.bool()
+        if hasattr(lora_config, 'mask') and lora_config.mask is not None:
+            self.mask = lora_config.mask.bool()
         else:
             raise ValueError("Mask not Provided with LoraConfigWithMask")
 
@@ -420,7 +420,6 @@ class Linear(nn.Module, LoraLayer):
         init_lora_weights: Union[bool, str] = True,
         use_rslora: bool = False,
         use_dora: bool = False,
-        lora_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -436,7 +435,6 @@ class Linear(nn.Module, LoraLayer):
             init_lora_weights=init_lora_weights,
             use_rslora=use_rslora,
             use_dora=use_dora,
-            lora_mask = lora_mask
         )
         self.is_target_conv_1d_layer = is_target_conv_1d_layer
 

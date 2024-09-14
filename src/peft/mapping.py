@@ -182,8 +182,8 @@ def get_peft_model(
         peft_config.revision = revision
 
 
-    if hasattr(peft_config,"lora_mask") and peft_config.lora_mas is not None:
-        print("Mask provided with shape {peft_config.lora_mask.shape}")
+    if hasattr(peft_config,"mask") and peft_config.mask is not None:
+        print("Mask provided with shape {peft_config.mask.shape}")
     else:
         print("No mask provided")
 

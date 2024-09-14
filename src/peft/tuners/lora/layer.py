@@ -127,7 +127,6 @@ class LoraLayer(BaseTunerLayer):
 
         if hasattr(lora_config, 'mask') and lora_config.mask is not None:
             self.mask = lora_config.mask 
-            self.mask = self.mask.to(self.lora_A.weight.device)
         else:
             raise ValueError("Mask not Provided with LoraConfigWithMask")
 
@@ -604,7 +603,7 @@ class Linear(nn.Module, LoraLayer):
 
                 if not self.use_dora[active_adapter]:
                     delta_W = lora_B.weight @ lora_A.weight
-                    delta_W = delta_W * self.mask
+                    delta_W = delta_W * self.mask 
                     # if active_adapter in self.lora_mask:
                     #     mask = self.lora_mask[active_adapter]
                     #     delta_W = delta_W * mask

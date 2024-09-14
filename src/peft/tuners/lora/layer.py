@@ -36,7 +36,7 @@ class LoraLayer(BaseTunerLayer):
     # All names of layers that may contain (trainable) adapter weights
     adapter_layer_names = ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B")
     # All names of other parameters that may contain adapter-related parameters
-    other_param_names = ("r", "lora_alpha", "scaling", "lora_dropout")
+    other_param_names = ("r", "lora_alpha", "scaling", "lora_dropout","lora_mask")
 
     def __init__(self, base_layer: nn.Module, ephemeral_gpu_offload: bool = False, **kwargs) -> None:
         self.base_layer = base_layer
@@ -57,6 +57,8 @@ class LoraLayer(BaseTunerLayer):
         self._caches: dict[str, Any] = {}
         self.ephemeral_gpu_offload: bool = ephemeral_gpu_offload
         self.kwargs = kwargs
+        self.lora_mask = nn.ParameterDict({})
+
 
         base_layer = self.get_base_layer()
         if isinstance(base_layer, nn.Linear):
@@ -101,7 +103,7 @@ class LoraLayer(BaseTunerLayer):
         self.out_features = out_features
 
     def update_layer(
-        self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora, use_dora: bool = False
+        self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora, use_dora: bool = False, lora_mask
     ):
         # This code works for linear layers, override for other layer types
         if r <= 0:
@@ -118,6 +120,11 @@ class LoraLayer(BaseTunerLayer):
         # Actual trainable parameters
         self.lora_A[adapter_name] = nn.Linear(self.in_features, r, bias=False)
         self.lora_B[adapter_name] = nn.Linear(r, self.out_features, bias=False)
+
+
+        if lora_mask is not None:
+            self.lora_mask[adapter_name] = nn.Parameter(lora_mask, requires_grad = False)
+
         if use_rslora:
             self.scaling[adapter_name] = lora_alpha / math.sqrt(r)
         else:
@@ -407,6 +414,7 @@ class Linear(nn.Module, LoraLayer):
         init_lora_weights: Union[bool, str] = True,
         use_rslora: bool = False,
         use_dora: bool = False,
+        lora_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -422,6 +430,7 @@ class Linear(nn.Module, LoraLayer):
             init_lora_weights=init_lora_weights,
             use_rslora=use_rslora,
             use_dora=use_dora,
+            lora_mask = lora_mask
         )
         self.is_target_conv_1d_layer = is_target_conv_1d_layer
 
@@ -576,10 +585,22 @@ class Linear(nn.Module, LoraLayer):
                 lora_B = self.lora_B[active_adapter]
                 dropout = self.lora_dropout[active_adapter]
                 scaling = self.scaling[active_adapter]
+
+                # mask = self.lora_mask[active_adapter] # Get the mask for this adapter
+                
                 x = x.to(lora_A.weight.dtype)
 
+
+                # if not self.use_dora[active_adapter]:
+                #     delta_W = (lora_B.weight @ lora_A.weight) * mask
+                #     result = result + (dropout(x) @ delta_W.T) * scaling
+
                 if not self.use_dora[active_adapter]:
-                    result = result + lora_B(lora_A(dropout(x))) * scaling
+                    delta_W = lora_B.weight @ lora_A.weight
+                    if active_adapter in self.lora_mask:
+                        mask = self.lora_mask[active_adapter]
+                        delta_W = delta_W * mask
+                    result = result + (dropout(x) @ delta_W.T) * scaling
                 else:
                     x = dropout(x)
                     result = result + self.lora_magnitude_vector[active_adapter](

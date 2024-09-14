@@ -17,7 +17,7 @@ from __future__ import annotations
 import warnings
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Union
-
+import torch
 from torch import nn
 
 from peft.config import PeftConfig
@@ -168,6 +168,12 @@ class LoraConfig(PeftConfig):
     )
     lora_alpha: int = field(default=8, metadata={"help": "Lora alpha"})
     lora_dropout: float = field(default=0.0, metadata={"help": "Lora dropout"})
+    lora_mask: Optional[torch.Tensor] = field(
+        default=None, 
+        metadata={"help": "Mask to be applied to the LoRA weights. If None, no mask is applied."}
+    )
+
+
     fan_in_fan_out: bool = field(
         default=False,
         metadata={"help": "Set this to True if the layer to replace stores weight like (fan_in, fan_out)"},

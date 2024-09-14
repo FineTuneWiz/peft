@@ -181,6 +181,14 @@ def get_peft_model(
             )
         peft_config.revision = revision
 
+
+    if hasattr(peft_config,"lora_mask") and peft_config.lora_mas is not None:
+        print("Mask provided with shape {peft_config.lora_mask.shape}")
+    else:
+        print("No mask provided")
+
+
+
     if mixed:
         # note: PeftMixedModel does not support autocast_adapter_dtype, so don't pass it
         return PeftMixedModel(model, peft_config, adapter_name=adapter_name)

@@ -126,7 +126,8 @@ class LoraLayer(BaseTunerLayer):
         #     self.lora_mask[adapter_name] = nn.Parameter(self.lora_mask, requires_grad = False)
 
         if hasattr(lora_config, 'mask') and lora_config.mask is not None:
-            self.mask = lora_config.mask.bool()
+            self.mask = lora_config.mask 
+            self.mask = self.mask.to(self.lora_A.weight.device)
         else:
             raise ValueError("Mask not Provided with LoraConfigWithMask")
 
